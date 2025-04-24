@@ -182,7 +182,6 @@
  
      // Parameters
      std::mutex config_mutex_;
-     bool goal_achieved_ = false;
      double max_vel_x_;
      double max_vel_x_limited_;
      double min_vel_x_;
@@ -220,6 +219,7 @@
  
      // Optional visualization of colliding and non-colliding points checked
      visualization_msgs::msg::MarkerArray *collision_points_;
+     bool goal_achieved_ = false;
  
      // Reverse motion addition
      bool backward_motion_;
