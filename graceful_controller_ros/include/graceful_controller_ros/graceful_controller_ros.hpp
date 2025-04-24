@@ -232,12 +232,6 @@
  
      rcl_interfaces::msg::SetParametersResult onParameterChange(
      const std::vector<rclcpp::Parameter>& parameters);
-     {
-         // Handle parameter change
-         rcl_interfaces::msg::SetParametersResult result;
-         result.successful = true;
-         return result;
-     }
    };
  
    /**
