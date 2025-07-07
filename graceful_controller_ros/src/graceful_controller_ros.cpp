@@ -656,17 +656,13 @@
        } while (sim_velocity >= scaling_vel_x_);
      }
  
-     RCLCPP_INFO(LOGGER, "No reachable pose found in the plan. Stopping the robot.");
-     cmd_vel.twist.linear.x = 0.0;
-     cmd_vel.twist.angular.z = 0.0;
-     goal_achieved_ = true; // Set the flag
- 
-     // Log the cmd_vel before returning
-     RCLCPP_INFO(LOGGER, "cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
-                 cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
-     RCLCPP_INFO(LOGGER, "---- GOAL ACHIEVED ----");
- 
-     return cmd_vel;
+    RCLCPP_WARN(LOGGER, "No reachable pose found in the plan. Stopping the robot.");
+    cmd_vel.twist.linear.x = 0.0;
+    cmd_vel.twist.angular.z = 0.0;
+
+    // Do NOT set goal_achieved_ = true here
+    // Instead, throw or return a failure for the BT to handle
+    throw std::runtime_error("No reachable pose found. Aborting navigation from BT.");
    }
  
    bool GracefulControllerROS::simulate(
