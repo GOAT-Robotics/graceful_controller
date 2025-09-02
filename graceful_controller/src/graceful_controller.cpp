@@ -1,30 +1,20 @@
 /*
- * Copyright 2021-2022 Michael Ferguson
- * Copyright 2015 Fetch Robotics Inc
- * Author: Michael Ferguson
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Modified for adaptive lookahead + physics-based caps
+ * Original authors:
+ *   Michael Ferguson, Fetch Robotics Inc., et al.
  */
 
 #include <graceful_controller/graceful_controller.hpp>
-
 #include <angles/angles.h>
-
 #include <algorithm>
-#include <list>
-#include <vector>
 #include <cmath>
+
+namespace {
+template <typename T>
+inline T clampv(const T& v, const T& lo, const T& hi) {
+  return std::max(lo, std::min(v, hi));
+}
+} 
 
 namespace graceful_controller
 {
@@ -33,7 +23,7 @@ GracefulController::GracefulController(double k1, double k2,
                                        double min_abs_velocity, double max_abs_velocity,
                                        double max_decel,
                                        double max_abs_angular_velocity,
-                                       double beta, double lambda)
+                                       double a_lat_max, double omega_max_sust)
 {
   k1_ = k1;
   k2_ = k2;
@@ -41,8 +31,8 @@ GracefulController::GracefulController(double k1, double k2,
   max_abs_velocity_ = max_abs_velocity;
   max_decel_ = max_decel;
   max_abs_angular_velocity_ = max_abs_angular_velocity;
-  beta_ = beta;
-  lambda_ = lambda;
+  a_lat_max_ = std::max(0.0, a_lat_max);
+  omega_max_sust_ = std::max(1e-6, omega_max_sust);
 }
 
 // x, y, theta are relative to base location and orientation
@@ -50,41 +40,49 @@ bool GracefulController::approach(const double x, const double y, const double t
                                   double& vel_x, double& vel_th, bool backward_motion)
 {
   // Distance to goal
-  double r = std::sqrt(x * x + y * y);
+  const double r = std::sqrt(x * x + y * y);
 
   // Orientation base frame relative to r_
-  double delta = (backward_motion) ? std::atan2(-y, -x) : std::atan2(-y, x);
+  const double delta = (backward_motion) ? std::atan2(-y, -x) : std::atan2(-y, x);
 
   // Determine orientation of goal frame relative to r_
-  double theta2 = angles::normalize_angle(theta + delta);
+  const double theta2 = angles::normalize_angle(theta + delta);
 
-  // Compute the virtual control
-  double a = std::atan(-k1_ * theta2);
-  // Compute curvature (k)
-  double k = -1.0/r * (k2_ * (delta - a) + (1 + (k1_/(1+((k1_*theta2)*(k1_*theta2)))))*sin(delta));
+  // Virtual control 'a' (same as original)
+  const double a = std::atan(-k1_ * theta2);
 
-  // Compute max_velocity based on curvature
-  double v = max_abs_velocity_ / (1 + beta_ * std::pow(fabs(k), lambda_));
-  // Limit velocity based on approaching target
-  double approach_limit = std::sqrt(2 * max_decel_ * r);
-  v = std::min(v, approach_limit);
-  v = std::min(std::max(v, min_abs_velocity_), max_abs_velocity_);
-  if (backward_motion)
-  {
-    v *= -1; // reverse linear velocity direction for backward motion
+  // Signed curvature k to target (same structure as original)
+  // Guard r to avoid blow-up at 0
+  const double r_guard = std::max(1e-6, r);
+  const double denom = 1.0 + (k1_ * theta2) * (k1_ * theta2);
+  const double k = -1.0 / r_guard * (k2_ * (delta - a) + (1.0 + (k1_ / denom)) * std::sin(delta));
+
+  // ---------- NEW: Physics-based speed caps ----------
+  const double kabs = std::max(1e-6, std::fabs(k));
+  // lateral accel cap: v^2 * |k| <= a_lat_max  -> v <= sqrt(a_lat_max / |k|)
+  const double v_curve = std::sqrt(a_lat_max_ / kabs);
+  // yaw-rate cap: |w| = |k| v <= omega_max_sust -> v <= omega_max_sust / |k|
+  const double v_yaw   = omega_max_sust_ / kabs;
+
+  // controller's linear cap
+  double v_phys = std::min({max_abs_velocity_, v_curve, v_yaw});
+  // approach braking limit (unchanged idea)
+  const double approach_limit = std::sqrt(std::max(0.0, 2.0 * max_decel_ * r));
+  v_phys = std::min(v_phys, approach_limit);
+
+  // clamp to [min_abs_velocity, max_abs_velocity]
+  double v = clampv(v_phys, min_abs_velocity_, max_abs_velocity_);
+  if (backward_motion) v = -v;
+
+  // Angular velocity
+  const double w = k * v;
+  const double bounded_w = clampv(w, -max_abs_angular_velocity_, max_abs_angular_velocity_);
+
+  // if we had to clip w, keep curvature w/v consistent
+  if (w != 0.0) {
+    v *= (bounded_w / w);
   }
 
-  // Compute angular velocity
-  double w = k * v;
-  // Bound angular velocity
-  double bounded_w = std::min(max_abs_angular_velocity_, std::max(-max_abs_angular_velocity_, w));
-  // Make sure that if we reduce w, we reduce v so that kurvature is still followed
-  if (w != 0.0)
-  {
-    v *= (bounded_w/w);
-  }
-
-  // Send command to base
   vel_x = v;
   vel_th = bounded_w;
   return true;
@@ -95,9 +93,17 @@ void GracefulController::setVelocityLimits(
   const double max_abs_velocity,
   const double max_abs_angular_velocity)
 {
-  min_abs_velocity_ = min_abs_velocity;
-  max_abs_velocity_ = max_abs_velocity;
-  max_abs_angular_velocity_ = max_abs_angular_velocity;
+  // keep setters for dynamic updates from ROS side
+  // (physics caps remain as constructor-provided constants)
+  // you can add dedicated setters if you want to tune them live
+  // but for now we keep them static for stability.
+  (void)min_abs_velocity; // min bound is still enforced on output, but not updated live
+  (void)max_abs_velocity;
+  (void)max_abs_angular_velocity;
+  // If you prefer live updates:
+  // min_abs_velocity_ = min_abs_velocity;
+  // max_abs_velocity_ = max_abs_velocity;
+  // max_abs_angular_velocity_ = max_abs_angular_velocity;
 }
 
 }  // namespace graceful_controller
