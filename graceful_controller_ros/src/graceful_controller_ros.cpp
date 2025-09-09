@@ -265,6 +265,14 @@
  
      RCLCPP_INFO(LOGGER, "Controller parameters: k1=%.2f, k2=%.2f, beta=%.2f, lambda=%.2f",
                  k1, k2, beta, lambda);
+                 
+     //Parameter sanity checks, if not satisfied, throw and prevent from getting to READY state
+     if (k1 == 0.0 && k2 == 0.0)
+     {
+      RCLCPP_ERROR(LOGGER, "GracefulController -> configure failed: k1 and k2 cannot both be zero.");
+      throw std::runtime_error("Invalid parameters: k1 and k2 both zero");
+      return;
+     }
  
      // Set backward motion
      backward_motion_ = false;
