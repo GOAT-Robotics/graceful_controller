@@ -160,6 +160,10 @@
       */
      void robot_pose_callback(
          const geometry_msgs::msg::PoseStamped::SharedPtr msg);
+
+     double computeCurveFactor(
+         const std::vector<geometry_msgs::msg::PoseStamped> & target_poses,
+         const std::vector<double> & target_distances) const;
  
      rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
      rclcpp::Clock::SharedPtr clock_;
@@ -197,6 +201,11 @@
      double scaling_step_;
      double min_lookahead_;
      double max_lookahead_;
+     double curve_detection_distance_;
+     double curve_turn_threshold_;
+     double curve_turn_full_threshold_;
+     double curve_min_lookahead_distance_;
+     double curve_min_speed_;
      double resolution_;
      double acc_dt_;
      double yaw_filter_tolerance_;

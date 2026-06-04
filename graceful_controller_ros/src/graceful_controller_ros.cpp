@@ -7,6 +7,7 @@
  * Author: Eitan Marder-Eppstein, Michael Ferguson
  *********************************************************************/
 
+ #include <algorithm>
  #include <cmath>
  #include <mutex>
  
@@ -174,6 +175,11 @@
      declare_parameter_if_not_declared(node, name_ + ".decel_lim_x", rclcpp::ParameterValue(1.0)); // Set a positive value
      declare_parameter_if_not_declared(node, name_ + ".max_lookahead", rclcpp::ParameterValue(1.0));
      declare_parameter_if_not_declared(node, name_ + ".min_lookahead", rclcpp::ParameterValue(0.25));
+     declare_parameter_if_not_declared(node, name_ + ".curve_detection_distance", rclcpp::ParameterValue(1.5));
+     declare_parameter_if_not_declared(node, name_ + ".curve_turn_threshold", rclcpp::ParameterValue(0.35));
+     declare_parameter_if_not_declared(node, name_ + ".curve_turn_full_threshold", rclcpp::ParameterValue(1.05));
+     declare_parameter_if_not_declared(node, name_ + ".curve_min_lookahead_distance", rclcpp::ParameterValue(0.4));
+     declare_parameter_if_not_declared(node, name_ + ".curve_min_speed", rclcpp::ParameterValue(0.25));
      declare_parameter_if_not_declared(node, name_ + ".initial_rotate_tolerance", rclcpp::ParameterValue(0.1));
      declare_parameter_if_not_declared(node, name_ + ".prefer_final_rotation", rclcpp::ParameterValue(false));
      declare_parameter_if_not_declared(node, name_ + ".compute_orientations", rclcpp::ParameterValue(true));
@@ -209,6 +215,11 @@
      node->get_parameter(name_ + ".decel_lim_x", decel_lim_x_);
      node->get_parameter(name_ + ".max_lookahead", max_lookahead_);
      node->get_parameter(name_ + ".min_lookahead", min_lookahead_);
+     node->get_parameter(name_ + ".curve_detection_distance", curve_detection_distance_);
+     node->get_parameter(name_ + ".curve_turn_threshold", curve_turn_threshold_);
+     node->get_parameter(name_ + ".curve_turn_full_threshold", curve_turn_full_threshold_);
+     node->get_parameter(name_ + ".curve_min_lookahead_distance", curve_min_lookahead_distance_);
+     node->get_parameter(name_ + ".curve_min_speed", curve_min_speed_);
      node->get_parameter(name_ + ".initial_rotate_tolerance", initial_rotate_tolerance_);
      node->get_parameter(name_ + ".prefer_final_rotation", prefer_final_rotation_);
      node->get_parameter(name_ + ".compute_orientations", compute_orientations_);
@@ -240,6 +251,11 @@
      RCLCPP_INFO(LOGGER, "  decel_lim_x: %.2f", decel_lim_x_);
      RCLCPP_INFO(LOGGER, "  max_lookahead: %.2f", max_lookahead_);
      RCLCPP_INFO(LOGGER, "  min_lookahead: %.2f", min_lookahead_);
+     RCLCPP_INFO(LOGGER, "  curve_detection_distance: %.2f", curve_detection_distance_);
+     RCLCPP_INFO(LOGGER, "  curve_turn_threshold: %.2f", curve_turn_threshold_);
+     RCLCPP_INFO(LOGGER, "  curve_turn_full_threshold: %.2f", curve_turn_full_threshold_);
+     RCLCPP_INFO(LOGGER, "  curve_min_lookahead_distance: %.2f", curve_min_lookahead_distance_);
+     RCLCPP_INFO(LOGGER, "  curve_min_speed: %.2f", curve_min_speed_);
      RCLCPP_INFO(LOGGER, "  initial_rotate_tolerance: %.2f", initial_rotate_tolerance_);
      RCLCPP_INFO(LOGGER, "  prefer_final_rotation: %s", prefer_final_rotation_ ? "TRUE" : "FALSE");
      RCLCPP_INFO(LOGGER, "  compute_orientations: %s", compute_orientations_ ? "TRUE" : "FALSE");
@@ -417,7 +433,7 @@
        const geometry_msgs::msg::Twist &velocity,
        nav2_core::GoalChecker *goal_checker)
    {
-     RCLCPP_INFO(LOGGER, "Goal has already been achieved. Stopping the robot.");
+    //  RCLCPP_INFO(LOGGER, "Goal has already been achieved. Stopping the robot.");
      std::lock_guard<std::mutex> lock(config_mutex_);
  
      geometry_msgs::msg::TwistStamped cmd_vel;
@@ -609,21 +625,44 @@
      }
      computeDistanceAlongPath(target_poses, target_distances);
  
-     // Work back from the end of plan to find valid target pose
-     RCLCPP_INFO(LOGGER, "Iterating through the plan to find a valid target pose.");
+     const double curve_factor = computeCurveFactor(target_poses, target_distances);
+     
+     const double curve_min_lookahead = std::max(
+         resolution_, std::min(max_lookahead_, curve_min_lookahead_distance_));
+     const double active_max_lookahead = std::max(
+         curve_min_lookahead,
+         max_lookahead_ - curve_factor * (max_lookahead_ - curve_min_lookahead));
+     const double active_min_lookahead = std::max(
+         resolution_, std::min(min_lookahead_, active_max_lookahead));
+
+     const double curve_min_speed = std::max(
+         min_vel_x_, std::min(max_vel_x, curve_min_speed_));
+
+     max_vel_x = std::max(
+         curve_min_speed,
+         max_vel_x - curve_factor * (max_vel_x - curve_min_speed));
  
+     RCLCPP_INFO(
+         LOGGER,
+         "curve_factor=%.2f active_min_lookahead=%.2f active_max_lookahead=%.2f "
+         "curve_limited_max_vel_x=%.2f",
+         curve_factor, active_min_lookahead, active_max_lookahead, max_vel_x);
+
+     // Work back from the end of plan to find valid target pose
+    //  RCLCPP_INFO(LOGGER, "Iterating through the plan to find a valid target pose.");
+
      for (int i = global_plan_.poses.size() - 1; i >= 0; --i)
      {
        geometry_msgs::msg::PoseStamped target_pose = target_poses[i];
        double dist_to_target = target_distances[i];
- 
+
        // Continue if target_pose is too far away from robot
-       if (dist_to_target > max_lookahead_)
+       if (dist_to_target > active_max_lookahead)
        {
          continue;
        }
- 
-       if (dist_to_goal < max_lookahead_)
+
+       if (dist_to_goal < active_max_lookahead)
        {
          if (prefer_final_rotation_)
          {
@@ -632,7 +671,7 @@
            target_pose.pose.orientation.w = cos(yaw / 2.0);
          }
        }
-       else if (dist_to_target < min_lookahead_)
+       else if (dist_to_target < active_min_lookahead)
        {
          // Make sure target is far enough away to avoid instability
          break;
@@ -646,7 +685,7 @@
  
          if (simulate(target_pose, velocity, cmd_vel))
          {
-           RCLCPP_INFO(LOGGER, "Simulation successful with sim_velocity: %.2f", sim_velocity);
+          //  RCLCPP_INFO(LOGGER, "Simulation successful with sim_velocity: %.2f", sim_velocity);
            RCLCPP_INFO(LOGGER, "After Simulation -> cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
                        cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
            if (dist_to_goal < ignore_orientation_distance_)
@@ -678,10 +717,12 @@
        const geometry_msgs::msg::Twist &velocity,
        geometry_msgs::msg::TwistStamped &cmd_vel)
    {
-     RCLCPP_INFO(LOGGER, "Starting simulation towards target pose.");
+    //  RCLCPP_INFO(LOGGER, "Starting simulation towards target pose.");
  
      // Simulated path (for debugging/visualization)
      nav_msgs::msg::Path simulated_path;
+     simulated_path.header.frame_id = costmap_ros_->getBaseFrameID();
+     simulated_path.header.stamp = clock_->now();
      // Should we simulate rotation initially
      bool sim_initial_rotation_ = has_new_path_ && initial_rotate_tolerance_ > 0.0;
  
@@ -772,7 +813,7 @@
        else if (std::hypot(error.pose.position.x, error.pose.position.y) < resolution_)
        {
          // We've simulated to the desired pose, can return this result
-         RCLCPP_INFO(LOGGER, "Simulation reached target pose within resolution.");
+        //  RCLCPP_INFO(LOGGER, "Simulation reached target pose within resolution.");
          local_plan_pub_->publish(simulated_path);
          target_pose_pub_->publish(target_pose);
  
@@ -782,8 +823,8 @@
            collision_points_->markers[0].header.stamp = clock_->now();
            collision_points_pub_->publish(*collision_points_);
          }
-         RCLCPP_INFO(LOGGER, "Simulation successful. cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
-                     cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
+        //  RCLCPP_INFO(LOGGER, "Simulation successful. cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
+        //              cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
          return true;
        }
  
@@ -809,6 +850,9 @@
        yaw += dt * vel_th;
        next_pose.pose.orientation.z = sin(yaw / 2.0);
        next_pose.pose.orientation.w = cos(yaw / 2.0);
+
+       next_pose.header.stamp = clock_->now();
+       next_pose.header.frame_id = costmap_ros_->getBaseFrameID();
        simulated_path.poses.push_back(next_pose);
  
        // Compute footprint scaling
@@ -956,7 +1000,74 @@
      goal_achieved_ = false; // Reset the flag
      RCLCPP_INFO(LOGGER, "Plan set successfully in frame: %s", filtered_plan.header.frame_id.c_str());
    }
- 
+
+   double GracefulControllerROS::computeCurveFactor(
+       const std::vector<geometry_msgs::msg::PoseStamped> &target_poses,
+       const std::vector<double> &target_distances) const
+   {
+     if (target_poses.size() < 3 || target_distances.size() != target_poses.size())
+     {
+       return 0.0;
+     }
+
+     const auto closest_it = std::min_element(target_distances.begin(), target_distances.end());
+     if (closest_it == target_distances.end())
+     {
+       return 0.0;
+     }
+
+     const std::size_t closest_index =
+         static_cast<std::size_t>(std::distance(target_distances.begin(), closest_it));
+     if (closest_index + 2 >= target_poses.size())
+     {
+       return 0.0;
+     }
+
+     const double min_segment_length = std::max(0.05, resolution_ * 0.5);
+     const double horizon = std::max(curve_detection_distance_, max_lookahead_);
+     double accumulated_turn = 0.0;
+     double last_heading = 0.0;
+     bool have_heading = false;
+
+     for (std::size_t i = closest_index; i + 1 < target_poses.size(); ++i)
+     {
+       const double along_path_distance = target_distances[i + 1] - *closest_it;
+       if (along_path_distance > horizon)
+       {
+         break;
+       }
+
+       const double dx =
+           target_poses[i + 1].pose.position.x - target_poses[i].pose.position.x;
+       const double dy =
+           target_poses[i + 1].pose.position.y - target_poses[i].pose.position.y;
+       const double segment_length = std::hypot(dx, dy);
+       if (segment_length < min_segment_length)
+       {
+         continue;
+       }
+
+       const double heading = std::atan2(dy, dx);
+       if (have_heading)
+       {
+         accumulated_turn +=
+             std::abs(angles::shortest_angular_distance(last_heading, heading));
+       }
+
+       last_heading = heading;
+       have_heading = true;
+     }
+
+     const double turn_range = curve_turn_full_threshold_ - curve_turn_threshold_;
+     if (!have_heading || turn_range <= 0.0)
+     {
+       return 0.0;
+     }
+
+     return std::clamp(
+         (accumulated_turn - curve_turn_threshold_) / turn_range, 0.0, 1.0);
+   }
+
    double GracefulControllerROS::rotateTowards(
        const geometry_msgs::msg::PoseStamped &pose,
        const geometry_msgs::msg::Twist &velocity,
