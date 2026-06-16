@@ -194,8 +194,8 @@
      // Params for backwards motion
      declare_parameter_if_not_declared(node, name_ + ".backward_motion_available", rclcpp::ParameterValue(false));
      declare_parameter_if_not_declared(node, name_ + ".backwards_check_yaw_tolerance", rclcpp::ParameterValue(0.34));
- 
      declare_parameter_if_not_declared(node, name_ + ".ignore_orientation_distance", rclcpp::ParameterValue(0.10));
+     declare_parameter_if_not_declared(node, name_ + ".distance_to_goal_frequency", rclcpp::ParameterValue(50.0));
  
      // Retrieve parameters
      node->get_parameter(name_ + ".max_vel_x", max_vel_x_);
@@ -224,9 +224,11 @@
      // Params for backwards motion
      node->get_parameter(name_ + ".backward_motion_available", backward_motion_available_);
      node->get_parameter(name_ + ".backwards_check_yaw_tolerance", backwards_check_yaw_tolerance_);
- 
      node->get_parameter(name_ + ".ignore_orientation_distance", ignore_orientation_distance_);
+     node->get_parameter(name_ + ".distance_to_goal_frequency", distance_to_goal_frequency_);
  
+     distance_to_goal_pub_ = node->create_publisher<std_msgs::msg::Float32>("/distance_to_goal", 10);
+
      // Log loaded parameters
      RCLCPP_INFO(LOGGER, "Parameters loaded:");
      RCLCPP_INFO(LOGGER, "  max_vel_x: %.2f", max_vel_x_);
@@ -299,7 +301,7 @@
      local_plan_pub_ = node->create_publisher<nav_msgs::msg::Path>(name_ + "/local_plan", 1);
      target_pose_pub_ = node->create_publisher<geometry_msgs::msg::PoseStamped>(name_ + "/target_pose", 1);
      RCLCPP_INFO(LOGGER, "Publishers for global_plan, local_plan, and target_pose initialized.");
- 
+     
      // Subscriber Robot pose if backward motion is needed
      if (backward_motion_available_)
      {
@@ -360,9 +362,10 @@
      RCLCPP_INFO(LOGGER, "GracefulController instance created.");
  
      initialized_ = true;
+     last_ticked_time_ = clock_->now();
      RCLCPP_INFO(LOGGER, "GracefulControllerROS successfully configured and initialized.");
-   }
- 
+  }
+
    void GracefulControllerROS::cleanup()
    {
      RCLCPP_INFO(LOGGER, "Cleaning up GracefulControllerROS.");
@@ -386,6 +389,17 @@
      }
      has_new_path_ = false;
      goal_achieved_ = false;
+ 
+     auto node = node_.lock();
+     if (node && distance_to_goal_frequency_ > 0.0)
+     {
+       double period_ms = 1000.0 / distance_to_goal_frequency_;
+       distance_timer_ = node->create_wall_timer(
+         std::chrono::duration<double, std::milli>(period_ms),
+         std::bind(&GracefulControllerROS::publishDistanceToGoal, this));
+       RCLCPP_INFO(LOGGER, "Created distance_to_goal timer with frequency: %.2f Hz", distance_to_goal_frequency_);
+     }
+ 
      RCLCPP_INFO(LOGGER, "GracefulControllerROS activated.");
    }
  
@@ -400,6 +414,7 @@
        collision_points_pub_->on_deactivate();
        RCLCPP_INFO(LOGGER, "Collision points publisher deactivated.");
      }
+     distance_timer_.reset();
      RCLCPP_INFO(LOGGER, "GracefulControllerROS deactivated.");
    }
  
@@ -419,6 +434,7 @@
    {
      RCLCPP_INFO(LOGGER, "Goal has already been achieved. Stopping the robot.");
      std::lock_guard<std::mutex> lock(config_mutex_);
+     last_ticked_time_ = clock_->now();
  
      geometry_msgs::msg::TwistStamped cmd_vel;
  
@@ -443,7 +459,7 @@
      }
  
      // Set header
-     cmd_vel.header.frame_id = robot_pose.header.frame_id;
+     cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
      cmd_vel.header.stamp = clock_->now();
  
      // Publish the global plan
@@ -645,20 +661,20 @@
          controller_->setVelocityLimits(min_vel_x_, sim_velocity, max_vel_theta_limited_);
  
          if (simulate(target_pose, velocity, cmd_vel))
-         {
-           RCLCPP_INFO(LOGGER, "Simulation successful with sim_velocity: %.2f", sim_velocity);
-           RCLCPP_INFO(LOGGER, "After Simulation -> cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
-                       cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
-           if (dist_to_goal < ignore_orientation_distance_)
-           {
-             RCLCPP_INFO(LOGGER, "1 Robot is within %.2f meters of the goal. Ignoring orientation changes.", dist_to_goal);
+          {
+            RCLCPP_INFO(LOGGER, "Simulation successful with sim_velocity: %.2f", sim_velocity);
+            RCLCPP_INFO(LOGGER, "After Simulation -> cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
+                        cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
  
-             cmd_vel.twist.angular.z = 0.0;
-           }
+            if (dist_to_goal < ignore_orientation_distance_)
+            {
+              RCLCPP_INFO(LOGGER, "Robot is within %.2f meters of the goal. Ignoring orientation changes.", dist_to_goal);
+              cmd_vel.twist.angular.z = 0.0;
+            }
            RCLCPP_INFO(LOGGER, "After correcting orientation linear.x: %.2f, angular.z: %.2f",
                        cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
-           return cmd_vel;
-         }
+            return cmd_vel;
+          }
  
          sim_velocity -= scaling_step_;
        } while (sim_velocity >= scaling_vel_x_);
@@ -667,7 +683,7 @@
     RCLCPP_WARN(LOGGER, "No reachable pose found in the plan. Stopping the robot.");
     cmd_vel.twist.linear.x = 0.0;
     cmd_vel.twist.angular.z = 0.0;
-
+ 
     // Do NOT set goal_achieved_ = true here
     // Instead, throw or return a failure for the BT to handle
     throw std::runtime_error("No reachable pose found. Aborting navigation from BT.");
@@ -682,6 +698,8 @@
  
      // Simulated path (for debugging/visualization)
      nav_msgs::msg::Path simulated_path;
+     simulated_path.header.frame_id = costmap_ros_->getBaseFrameID();
+     simulated_path.header.stamp = clock_->now();
      // Should we simulate rotation initially
      bool sim_initial_rotation_ = has_new_path_ && initial_rotate_tolerance_ > 0.0;
  
@@ -773,6 +791,7 @@
        {
          // We've simulated to the desired pose, can return this result
          RCLCPP_INFO(LOGGER, "Simulation reached target pose within resolution.");
+         simulated_path.header.stamp = clock_->now();
          local_plan_pub_->publish(simulated_path);
          target_pose_pub_->publish(target_pose);
  
@@ -809,6 +828,9 @@
        yaw += dt * vel_th;
        next_pose.pose.orientation.z = sin(yaw / 2.0);
        next_pose.pose.orientation.w = cos(yaw / 2.0);
+ 
+       next_pose.header.stamp = clock_->now();
+       next_pose.header.frame_id = costmap_ros_->getBaseFrameID();
        simulated_path.poses.push_back(next_pose);
  
        // Compute footprint scaling
@@ -1099,6 +1121,37 @@
        rcl_interfaces::msg::SetParametersResult result;
        result.successful = true;
        return result;
+   }
+ 
+   void GracefulControllerROS::publishDistanceToGoal()
+   {
+     std::lock_guard<std::mutex> lock(config_mutex_);
+ 
+     if (!initialized_ || global_plan_.poses.empty() || goal_achieved_ ||
+         (clock_->now() - last_ticked_time_).seconds() > 0.5)
+     {
+       return;
+     }
+ 
+     geometry_msgs::msg::TransformStamped plan_to_robot;
+     try
+     {
+       plan_to_robot = buffer_->lookupTransform(costmap_ros_->getBaseFrameID(),
+                                                global_plan_.header.frame_id,
+                                                tf2::TimePointZero);
+     }
+     catch (tf2::TransformException &ex)
+     {
+       return;
+     }
+ 
+     geometry_msgs::msg::PoseStamped goal_pose = global_plan_.poses.back();
+     tf2::doTransform(goal_pose, goal_pose, plan_to_robot);
+ 
+     double dist_to_goal = std::hypot(goal_pose.pose.position.x, goal_pose.pose.position.y);
+     std_msgs::msg::Float32 dist_msg;
+     dist_msg.data = dist_to_goal;
+     distance_to_goal_pub_->publish(dist_msg);
    }
  
  } // namespace graceful_controller

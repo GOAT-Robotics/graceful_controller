@@ -40,6 +40,7 @@
  #define GRACEFUL_CONTROLLER_ROS_GRACEFUL_CONTROLLER_ROS_HPP
  
  #include <mutex>
+ #include <chrono>
  
  #include <nav_msgs/msg/path.hpp>
  #include <nav2_core/controller.hpp>
@@ -169,7 +170,9 @@
      std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>> local_plan_pub_;
      std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>> target_pose_pub_;
      std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>> collision_points_pub_;
- 
+     
+     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr distance_to_goal_pub_;
+
      rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr robot_pose_sub_;
  
      bool initialized_;
@@ -227,6 +230,10 @@
      geometry_msgs::msg::PoseStamped robot_pose_;
      rclcpp::CallbackGroup::SharedPtr callback_group_;
      rclcpp::executors::SingleThreadedExecutor callback_group_executor_;
+     double distance_to_goal_frequency_;
+     rclcpp::TimerBase::SharedPtr distance_timer_;
+     rclcpp::Time last_ticked_time_;
+     void publishDistanceToGoal();
  
      rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
  
