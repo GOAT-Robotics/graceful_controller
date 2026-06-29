@@ -196,6 +196,9 @@
      declare_parameter_if_not_declared(node, name_ + ".scaling_vel_x", rclcpp::ParameterValue(0.3)); // Lower to initiate slowdown earlier
      declare_parameter_if_not_declared(node, name_ + ".scaling_factor", rclcpp::ParameterValue(0.4));
      declare_parameter_if_not_declared(node, name_ + ".scaling_step", rclcpp::ParameterValue(0.05));
+
+     declare_parameter_if_not_declared(node, name_ + ".curve_lookahead_decrease_rate", rclcpp::ParameterValue(0.8));
+     declare_parameter_if_not_declared(node, name_ + ".curve_lookahead_increase_rate", rclcpp::ParameterValue(0.4));
  
      // Params for backwards motion
      declare_parameter_if_not_declared(node, name_ + ".backward_motion_available", rclcpp::ParameterValue(false));
@@ -231,6 +234,9 @@
      node->get_parameter(name_ + ".scaling_vel_x", scaling_vel_x_);
      node->get_parameter(name_ + ".scaling_factor", scaling_factor_);
      node->get_parameter(name_ + ".scaling_step", scaling_step_);
+
+     node->get_parameter(name_ + ".curve_lookahead_decrease_rate", curve_lookahead_decrease_rate_);
+     node->get_parameter(name_ + ".curve_lookahead_increase_rate", curve_lookahead_increase_rate_);
  
      // Params for backwards motion
      node->get_parameter(name_ + ".backward_motion_available", backward_motion_available_);
@@ -402,6 +408,9 @@
      }
      has_new_path_ = false;
      goal_achieved_ = false;
+
+     filtered_lookahead_initialized_ = false;
+     filtered_max_lookahead_ = max_lookahead_;
      RCLCPP_INFO(LOGGER, "GracefulControllerROS activated.");
    }
  
@@ -461,6 +470,14 @@
      // Set header
      cmd_vel.header.frame_id = robot_pose.header.frame_id;
      cmd_vel.header.stamp = clock_->now();
+
+     if (global_plan_.poses.empty())
+     {
+      RCLCPP_WARN(LOGGER, "computeVelocityCommands skipped -> global_plan_ is empty.");
+      cmd_vel.twist.linear.x = 0.0;
+      cmd_vel.twist.angular.z = 0.0;
+      return cmd_vel;
+     }
  
      // Publish the global plan
      global_plan_pub_->publish(global_plan_);
@@ -556,8 +573,7 @@
            if (collision_free)
            {
              RCLCPP_INFO(LOGGER, "No collisions detected during rotation. Executing rotation command.");
-             RCLCPP_INFO(LOGGER, "cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
-                         cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
+             RCLCPP_INFO(LOGGER, "cmd_vel Output -> linear.x: %.2f, angular.z: %.2f", cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
              return cmd_vel;
            }
            // Otherwise, fall through and try to get closer to goal in XY
@@ -614,47 +630,96 @@
      }
  
      // Compute distance along path
-     std::vector<geometry_msgs::msg::PoseStamped> target_poses;
+     // Transform global plan into robot frame.
+    // This is used both for curve detection and target-pose selection.
+     std::vector<geometry_msgs::msg::PoseStamped> transformed_global_plan_poses;
      std::vector<double> target_distances;
-     for (auto &pose : global_plan_.poses)
+
+     transformed_global_plan_poses.reserve(global_plan_.poses.size());
+
+     for (const auto &pose : global_plan_.poses)
      {
-       // Transform potential target pose into base_link
-       geometry_msgs::msg::PoseStamped transformed_pose;
-       tf2::doTransform(pose, transformed_pose, plan_to_robot);
-       target_poses.push_back(transformed_pose);
-     }
-     computeDistanceAlongPath(target_poses, target_distances);
- 
-     const double curve_factor = computeCurveFactor(target_poses, target_distances);
+      geometry_msgs::msg::PoseStamped transformed_pose;
+      tf2::doTransform(pose, transformed_pose, plan_to_robot);
+      transformed_global_plan_poses.push_back(transformed_pose);
+    }
+
+     // Distances are still needed later for selecting the target/lookahead pose.
+     computeDistanceAlongPath(transformed_global_plan_poses, target_distances);
+
+    // Curve detection is now explicitly from the transformed global plan,
+     const double curve_factor = computeCurveFactorFromGlobalPlan(transformed_global_plan_poses);
      
-     const double curve_min_lookahead = std::max(
-         resolution_, std::min(max_lookahead_, curve_min_lookahead_distance_));
-     const double active_max_lookahead = std::max(
-         curve_min_lookahead,
-         max_lookahead_ - curve_factor * (max_lookahead_ - curve_min_lookahead));
-     const double active_min_lookahead = std::max(
-         resolution_, std::min(min_lookahead_, active_max_lookahead));
+     // LOOKAHEAD WITH GRADUAL ENTER + EXIT
+    
+     const double curve_min_lookahead = std::max(resolution_, std::min(max_lookahead_, curve_min_lookahead_distance_));
 
-     const double curve_min_speed = std::max(
-         min_vel_x_, std::min(max_vel_x, curve_min_speed_));
+     // Raw desired lookahead from current curve severity.
+     // curve_factor = 0.0 -> max_lookahead_
+     // curve_factor = 1.0 -> curve_min_lookahead
+     const double target_max_lookahead = max_lookahead_ - curve_factor * (max_lookahead_ - curve_min_lookahead);
 
-     max_vel_x = std::max(
-         curve_min_speed,
-         max_vel_x - curve_factor * (max_vel_x - curve_min_speed));
+     // Time delta
+     const rclcpp::Time now = clock_->now();
+
+     double dt = acc_dt_;
+
+     if (filtered_lookahead_initialized_)
+     {
+       const double measured_dt = (now - last_lookahead_update_time_).seconds();
+
+       if (std::isfinite(measured_dt) && measured_dt > 0.0 && measured_dt < 1.0)
+       {
+         dt = measured_dt;
+       }
+     }
+
+     last_lookahead_update_time_ = now;
+
+     // Initialize from full lookahead so even first curve entry reduces gradually
+     if (!filtered_lookahead_initialized_)
+     {
+       filtered_max_lookahead_ = max_lookahead_;
+       filtered_lookahead_initialized_ = true;
+     }
+
+     // Move filtered_max_lookahead_ gradually toward target_max_lookahead
+     if (target_max_lookahead < filtered_max_lookahead_)
+     {
+       // Entering curve: reduce gradually
+       const double max_decrease = std::max(0.0, curve_lookahead_decrease_rate_) * dt;
+
+       filtered_max_lookahead_ = std::max(target_max_lookahead, filtered_max_lookahead_ - max_decrease);
+     }
+     else if (target_max_lookahead > filtered_max_lookahead_)
+     {
+      // Exiting curve: increase gradually
+       const double max_increase = std::max(0.0, curve_lookahead_increase_rate_) * dt;
+
+       filtered_max_lookahead_ = std::min(target_max_lookahead, filtered_max_lookahead_ + max_increase);
+     }
+
+     const double active_max_lookahead = std::clamp(filtered_max_lookahead_, curve_min_lookahead, max_lookahead_);
+
+     // ensure min constraint
+     const double active_min_lookahead = std::max(resolution_, std::min(min_lookahead_, active_max_lookahead));
+
+     // SPEED 
+     const double curve_min_speed = std::max(min_vel_x_, std::min(max_vel_x, curve_min_speed_));
+
+     max_vel_x = max_vel_x - curve_factor * (max_vel_x - curve_min_speed);
  
-     RCLCPP_INFO(
-         LOGGER,
-         "curve_factor=%.2f active_min_lookahead=%.2f active_max_lookahead=%.2f "
-         "curve_limited_max_vel_x=%.2f",
-         curve_factor, active_min_lookahead, active_max_lookahead, max_vel_x);
+     RCLCPP_INFO(LOGGER, "curve_factor=%.3f target_max_lookahead=%.3f filtered_max_lookahead=%.3f " "active_min_lookahead=%.3f active_max_lookahead=%.3f "
+      "lookahead_decrease_rate=%.3f lookahead_increase_rate=%.3f " "curve_limited_max_vel_x=%.3f transformed_global_plan_poses=%zu",
+      curve_factor, target_max_lookahead, filtered_max_lookahead_, active_min_lookahead, active_max_lookahead,
+      curve_lookahead_decrease_rate_, curve_lookahead_increase_rate_, max_vel_x, transformed_global_plan_poses.size());
 
      // Work back from the end of plan to find valid target pose
-    //  RCLCPP_INFO(LOGGER, "Iterating through the plan to find a valid target pose.");
+     for (int i = static_cast<int>(transformed_global_plan_poses.size()) - 1; i >= 0; --i)
+	   {
+	    geometry_msgs::msg::PoseStamped target_pose = transformed_global_plan_poses[static_cast<std::size_t>(i)];
 
-     for (int i = global_plan_.poses.size() - 1; i >= 0; --i)
-     {
-       geometry_msgs::msg::PoseStamped target_pose = target_poses[i];
-       double dist_to_target = target_distances[i];
+	    double dist_to_target = target_distances[static_cast<std::size_t>(i)];
 
        // Continue if target_pose is too far away from robot
        if (dist_to_target > active_max_lookahead)
@@ -685,7 +750,6 @@
  
          if (simulate(target_pose, velocity, cmd_vel))
          {
-          //  RCLCPP_INFO(LOGGER, "Simulation successful with sim_velocity: %.2f", sim_velocity);
            RCLCPP_INFO(LOGGER, "After Simulation -> cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
                        cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
            if (dist_to_goal < ignore_orientation_distance_)
@@ -694,8 +758,6 @@
  
              cmd_vel.twist.angular.z = 0.0;
            }
-           RCLCPP_INFO(LOGGER, "After correcting orientation linear.x: %.2f, angular.z: %.2f",
-                       cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
            return cmd_vel;
          }
  
@@ -717,7 +779,6 @@
        const geometry_msgs::msg::Twist &velocity,
        geometry_msgs::msg::TwistStamped &cmd_vel)
    {
-    //  RCLCPP_INFO(LOGGER, "Starting simulation towards target pose.");
  
      // Simulated path (for debugging/visualization)
      nav_msgs::msg::Path simulated_path;
@@ -813,7 +874,6 @@
        else if (std::hypot(error.pose.position.x, error.pose.position.y) < resolution_)
        {
          // We've simulated to the desired pose, can return this result
-        //  RCLCPP_INFO(LOGGER, "Simulation reached target pose within resolution.");
          local_plan_pub_->publish(simulated_path);
          target_pose_pub_->publish(target_pose);
  
@@ -823,8 +883,7 @@
            collision_points_->markers[0].header.stamp = clock_->now();
            collision_points_pub_->publish(*collision_points_);
          }
-        //  RCLCPP_INFO(LOGGER, "Simulation successful. cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
-        //              cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
+  
          return true;
        }
  
@@ -998,74 +1057,137 @@
      has_new_path_ = true;
      goal_tolerance_met_ = false;
      goal_achieved_ = false; // Reset the flag
+
+     filtered_lookahead_initialized_ = false;
+     filtered_max_lookahead_ = max_lookahead_;
      RCLCPP_INFO(LOGGER, "Plan set successfully in frame: %s", filtered_plan.header.frame_id.c_str());
    }
 
-   double GracefulControllerROS::computeCurveFactor(
-       const std::vector<geometry_msgs::msg::PoseStamped> &target_poses,
-       const std::vector<double> &target_distances) const
+   double GracefulControllerROS::computeCurveFactorFromGlobalPlan(
+    const std::vector<geometry_msgs::msg::PoseStamped> &plan_poses) const
    {
-     if (target_poses.size() < 3 || target_distances.size() != target_poses.size())
-     {
-       return 0.0;
-     }
+    if (plan_poses.size() < 3)
+    {
+      RCLCPP_WARN(LOGGER, "Global plan curve detection skipped -> plan_poses too small: %zu", plan_poses.size());
+      return 0.0;
+    }
 
-     const auto closest_it = std::min_element(target_distances.begin(), target_distances.end());
-     if (closest_it == target_distances.end())
-     {
-       return 0.0;
-     }
+    // Since poses are transformed into base_link, robot is near (0, 0).
+    std::size_t closest_index = 0;
+    double closest_dist = std::hypot(plan_poses[0].pose.position.x, plan_poses[0].pose.position.y);
 
-     const std::size_t closest_index =
-         static_cast<std::size_t>(std::distance(target_distances.begin(), closest_it));
-     if (closest_index + 2 >= target_poses.size())
-     {
-       return 0.0;
-     }
+    for (std::size_t i = 1; i < plan_poses.size(); ++i)
+    {
+      const double dist = std::hypot(plan_poses[i].pose.position.x, plan_poses[i].pose.position.y);
 
-     const double min_segment_length = std::max(0.05, resolution_ * 0.5);
-     const double horizon = std::max(curve_detection_distance_, max_lookahead_);
-     double accumulated_turn = 0.0;
-     double last_heading = 0.0;
-     bool have_heading = false;
+      if (dist < closest_dist)
+      {
+        closest_dist = dist;
+        closest_index = i;
+      }
+    }
 
-     for (std::size_t i = closest_index; i + 1 < target_poses.size(); ++i)
-     {
-       const double along_path_distance = target_distances[i + 1] - *closest_it;
-       if (along_path_distance > horizon)
-       {
-         break;
-       }
+    if (closest_index + 2 >= plan_poses.size())
+    {
+      RCLCPP_WARN(LOGGER, "Global plan curve detection skipped -> closest_index near end. "
+          "closest_index=%zu plan_size=%zu closest_dist=%.3f",
+          closest_index, plan_poses.size(), closest_dist);
+      return 0.0;
+    }
 
-       const double dx =
-           target_poses[i + 1].pose.position.x - target_poses[i].pose.position.x;
-       const double dy =
-           target_poses[i + 1].pose.position.y - target_poses[i].pose.position.y;
-       const double segment_length = std::hypot(dx, dy);
-       if (segment_length < min_segment_length)
-       {
-         continue;
-       }
+    const double horizon = std::max(curve_detection_distance_, max_lookahead_);
 
-       const double heading = std::atan2(dy, dx);
-       if (have_heading)
-       {
-         accumulated_turn +=
-             std::abs(angles::shortest_angular_distance(last_heading, heading));
-       }
+    // Important:
+    // Do not use 0.013 here. Your global plan spacing is around 0.010 m.
+    // Use a larger sampling distance and accumulate small segments.
+    const double heading_sample_distance = std::max(0.05, resolution_);
 
-       last_heading = heading;
-       have_heading = true;
-     }
+    double travelled = 0.0;
+    double sample_accumulated = 0.0;
+    double accumulated_turn = 0.0;
 
-     const double turn_range = curve_turn_full_threshold_ - curve_turn_threshold_;
-     if (!have_heading || turn_range <= 0.0)
-     {
-       return 0.0;
-     }
+    double last_heading = 0.0;
+    bool have_heading = false;
 
-     return std::clamp(
-         (accumulated_turn - curve_turn_threshold_) / turn_range, 0.0, 1.0);
+    std::size_t scanned_segments = 0;
+    std::size_t valid_heading_segments = 0;
+
+    geometry_msgs::msg::Point sample_start = plan_poses[closest_index].pose.position;
+
+    for (std::size_t i = closest_index; i + 1 < plan_poses.size(); ++i)
+    {
+      const auto &p0 = plan_poses[i].pose.position;
+      const auto &p1 = plan_poses[i + 1].pose.position;
+
+      const double dx_seg = p1.x - p0.x;
+      const double dy_seg = p1.y - p0.y;
+      const double segment_length = std::hypot(dx_seg, dy_seg);
+
+      travelled += segment_length;
+      sample_accumulated += segment_length;
+      scanned_segments++;
+
+      if (travelled > horizon)
+      {
+        break;
+      }
+
+      // Wait until enough tiny plan segments are accumulated.
+      if (sample_accumulated < heading_sample_distance)
+      {
+        continue;
+      }
+
+      const double dx = p1.x - sample_start.x;
+      const double dy = p1.y - sample_start.y;
+      const double sample_length = std::hypot(dx, dy);
+
+      if (sample_length < 1e-4)
+      {
+        sample_start = p1;
+        sample_accumulated = 0.0;
+        continue;
+      }
+
+      const double heading = std::atan2(dy, dx);
+
+      if (have_heading)
+      {
+        accumulated_turn += std::abs(angles::shortest_angular_distance(last_heading, heading));
+      }
+
+      last_heading = heading;
+      have_heading = true;
+      valid_heading_segments++;
+
+      sample_start = p1;
+      sample_accumulated = 0.0;
+    }
+
+    const double turn_range = curve_turn_full_threshold_ - curve_turn_threshold_;
+
+    if (!have_heading || valid_heading_segments < 2)
+    {
+      RCLCPP_WARN(LOGGER, "Global plan curve detection skipped -> not enough sampled heading segments. "
+          "plan_size=%zu closest_index=%zu closest_dist=%.3f travelled=%.3f " "scanned_segments=%zu valid_heading_segments=%zu sample_distance=%.3f",
+          plan_poses.size(), closest_index, closest_dist, travelled, scanned_segments, valid_heading_segments, heading_sample_distance);
+      return 0.0;
+    }
+
+    if (turn_range <= 0.0)
+    {
+      RCLCPP_WARN(LOGGER, "Global plan curve detection skipped -> invalid turn thresholds. "
+          "curve_turn_threshold=%.3f curve_turn_full_threshold=%.3f",
+          curve_turn_threshold_, curve_turn_full_threshold_);
+      return 0.0;
+    }
+
+    const double curve_factor = std::clamp(
+        (accumulated_turn - curve_turn_threshold_) / turn_range,
+        0.0,
+        1.0);
+
+    return curve_factor;
    }
 
    double GracefulControllerROS::rotateTowards(

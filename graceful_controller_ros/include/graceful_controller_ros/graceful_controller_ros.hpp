@@ -140,6 +140,7 @@
       * or in absolute values in false case.
       */
      virtual void setSpeedLimit(const double &speed_limit, const bool &percentage);
+
  
    private:
      /**
@@ -161,9 +162,8 @@
      void robot_pose_callback(
          const geometry_msgs::msg::PoseStamped::SharedPtr msg);
 
-     double computeCurveFactor(
-         const std::vector<geometry_msgs::msg::PoseStamped> & target_poses,
-         const std::vector<double> & target_distances) const;
+     double computeCurveFactorFromGlobalPlan(
+         const std::vector<geometry_msgs::msg::PoseStamped> &plan_poses) const;
  
      rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
      rclcpp::Clock::SharedPtr clock_;
@@ -217,6 +217,13 @@
      bool backward_motion_available_;
      double backwards_check_yaw_tolerance_;
      double ignore_orientation_distance_;
+
+     double filtered_max_lookahead_{0.0};
+     bool filtered_lookahead_initialized_{false};
+     rclcpp::Time last_lookahead_update_time_;
+
+     double curve_lookahead_decrease_rate_{0.8};  // m/s, entering curve
+     double curve_lookahead_increase_rate_{0.4};  // m/s, exiting curve
  
      // Goal tolerance
      bool latch_xy_goal_tolerance_;
