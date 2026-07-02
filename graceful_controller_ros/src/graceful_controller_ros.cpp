@@ -740,10 +740,7 @@
 
        if (prefer_final_rotation_)
        {
-        const double carrot_yaw = 
-            std::atan2(
-                target_pose.pose.position.y,
-                target_pose.pose.position.x);
+        const double carrot_yaw = std::atan2(target_pose.pose.position.y, target_pose.pose.position.x);
 
         const bool moving_goal_yaw_alignment_allowed =
             dist_to_goal < goal_yaw_alignment_distance &&
@@ -751,7 +748,7 @@
 
         if (moving_goal_yaw_alignment_allowed)
         {
-          // Within 2 m of goal and yaw error is less than 20 deg.
+          // Within 1 m of goal and yaw error is less than 20 deg.
           // Start aligning to final goal yaw while moving.
           target_pose.pose.orientation.x = 0.0;
           target_pose.pose.orientation.y = 0.0;
@@ -762,15 +759,9 @@
           const double current_yaw_error_deg = current_yaw_error * 180.0 / M_PI;
           const double abs_current_yaw_error_deg = std::abs(current_yaw_error) * 180.0 / M_PI;
 
-          RCLCPP_INFO(LOGGER,
-              "Moving goal yaw alignment active -> dist_to_goal=%.3f "
-              "current_yaw_error=%.3f rad current_yaw_error_deg=%.2f deg "
-              "abs_yaw_error_deg=%.2f deg max_allowed=%.3f rad",
-              dist_to_goal,
-              current_yaw_error,
-              current_yaw_error_deg,
-              abs_current_yaw_error_deg,
-              max_moving_yaw_alignment_error);
+          RCLCPP_INFO(LOGGER, "Moving goal yaw alignment active -> dist_to_goal=%.3f "
+              "current_yaw_error=%.3f current_yaw_error_deg=%.2f abs_yaw_error_deg=%.2f deg max_allowed=%.3f rad",
+              dist_to_goal, current_yaw_error, current_yaw_error_deg, abs_current_yaw_error_deg, max_moving_yaw_alignment_error);
         }
         else if (dist_to_goal < active_max_lookahead)
         {
@@ -781,24 +772,18 @@
           target_pose.pose.orientation.z = std::sin(carrot_yaw / 2.0);
           target_pose.pose.orientation.w = std::cos(carrot_yaw / 2.0);
 
-          if (dist_to_goal < goal_yaw_alignment_distance &&
-              std::abs(final_yaw_error) > max_moving_yaw_alignment_error)
+          if (dist_to_goal < goal_yaw_alignment_distance && std::abs(final_yaw_error) > max_moving_yaw_alignment_error)
           {
-            RCLCPP_INFO(
-                LOGGER,
-                "Moving goal yaw alignment skipped -> yaw error too large. "
+            RCLCPP_INFO(LOGGER, "Moving goal yaw alignment skipped -> yaw error too large. "
                 "dist_to_goal=%.3f final_yaw_error=%.3f max_allowed=%.3f",
-                dist_to_goal,
-                final_yaw_error,
-                max_moving_yaw_alignment_error);
+                dist_to_goal, final_yaw_error, max_moving_yaw_alignment_error);
           }
         }
       }
 
       // Preserve old minimum-lookahead behavior.
       // Only break when we are not already close to the goal.
-      if (dist_to_goal >= active_max_lookahead &&
-          dist_to_target < active_min_lookahead)
+      if (dist_to_goal >= active_max_lookahead && dist_to_target < active_min_lookahead)
       {
         // Make sure target is far enough away to avoid instability
         break;
@@ -815,13 +800,9 @@
            RCLCPP_INFO(LOGGER, "After Simulation -> cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
                        cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
           
-           // --------------------------------------------------
            // MOVING FINAL YAW ALIGNMENT CORRECTION / HOLD
-           // --------------------------------------------------
-           const bool moving_goal_yaw_alignment_zone =
-              prefer_final_rotation_ &&
-              dist_to_goal < goal_yaw_alignment_distance &&
-              std::abs(final_yaw_error) <= max_moving_yaw_alignment_error;
+           const bool moving_goal_yaw_alignment_zone = prefer_final_rotation_ &&
+              dist_to_goal < goal_yaw_alignment_distance && std::abs(final_yaw_error) <= max_moving_yaw_alignment_error;
 
            if (moving_goal_yaw_alignment_zone)
            {
@@ -832,27 +813,17 @@
 
             if (std::abs(final_yaw_error) <= yaw_goal_tolerance)
             {
-              // Yaw is already inside tolerance.
-              // Do not allow path/carrot angular command to pull yaw away again.
+              // Yaw is already inside tolerance. Do not allow path/carrot angular command to pull yaw away again.
               cmd_vel.twist.angular.z = 0.0;
 
-              RCLCPP_INFO(
-                  LOGGER,
-                  "Moving yaw hold -> final_yaw_error=%.3f rad %.2f deg "
+              RCLCPP_INFO(LOGGER, "Moving yaw hold -> final_yaw_error=%.3f rad %.2f deg "
                   "yaw_goal_tolerance=%.3f before_angular_z=%.3f after_angular_z=%.3f",
-                  final_yaw_error,
-                  final_yaw_error * 180.0 / M_PI,
-                  yaw_goal_tolerance,
-                  before_angular_z,
-                  cmd_vel.twist.angular.z);
+                  final_yaw_error, final_yaw_error * 180.0 / M_PI, yaw_goal_tolerance, before_angular_z, cmd_vel.twist.angular.z);
             }
             else
             {
-              const double yaw_correction =
-                  std::clamp(
-                      yaw_align_kp * final_yaw_error,
-                      -max_yaw_align_correction,
-                      max_yaw_align_correction);
+              const double yaw_correction = std::clamp(yaw_align_kp * final_yaw_error,
+                      -max_yaw_align_correction, max_yaw_align_correction);
 
               if (cmd_vel.twist.angular.z * final_yaw_error < 0.0)
               {
@@ -863,30 +834,17 @@
                 cmd_vel.twist.angular.z += yaw_correction;
               }
 
-              cmd_vel.twist.angular.z =
-                  std::clamp(
-                      cmd_vel.twist.angular.z,
-                      -max_vel_theta_limited_,
-                      max_vel_theta_limited_);
+              cmd_vel.twist.angular.z = std::clamp(cmd_vel.twist.angular.z, -max_vel_theta_limited_, max_vel_theta_limited_);
 
-              RCLCPP_INFO(
-                  LOGGER,
-                  "Moving yaw correction -> final_yaw_error=%.3f rad %.2f deg "
+              RCLCPP_INFO(LOGGER, "Moving yaw correction -> final_yaw_error=%.3f rad %.2f deg "
                   "before_angular_z=%.3f yaw_correction=%.3f after_angular_z=%.3f",
-                  final_yaw_error,
-                  final_yaw_error * 180.0 / M_PI,
-                  before_angular_z,
-                  yaw_correction,
-                  cmd_vel.twist.angular.z);
+                  final_yaw_error, final_yaw_error * 180.0 / M_PI, before_angular_z, yaw_correction, cmd_vel.twist.angular.z);
             }
            }
 
            if (dist_to_goal < ignore_orientation_distance_ && !moving_goal_yaw_alignment_zone)
            {
-              RCLCPP_INFO(
-                  LOGGER,
-                  "Robot is within %.2f meters of the goal. Ignoring orientation changes.",
-                  dist_to_goal);
+              RCLCPP_INFO(LOGGER, "Robot is within %.2f meters of the goal. Ignoring orientation changes.", dist_to_goal);
 
               cmd_vel.twist.angular.z = 0.0;
            }
