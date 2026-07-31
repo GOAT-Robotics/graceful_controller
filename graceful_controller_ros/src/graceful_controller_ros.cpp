@@ -206,6 +206,8 @@ namespace graceful_controller
 
     declare_parameter_if_not_declared(node, name_ + ".ignore_orientation_distance", rclcpp::ParameterValue(0.10));
 
+    declare_parameter_if_not_declared(node, name_ + ".initial_rotate_start_yaw", rclcpp::ParameterValue(0.261799));  // 15 deg
+
     // Retrieve parameters
     node->get_parameter(name_ + ".max_vel_x", max_vel_x_);
     node->get_parameter(name_ + ".min_vel_x", min_vel_x_);
@@ -230,7 +232,6 @@ namespace graceful_controller
     node->get_parameter(name_ + ".yaw_filter_tolerance", yaw_filter_tolerance_);
     node->get_parameter(name_ + ".yaw_gap_tolerance", yaw_gap_tolerance_);
     node->get_parameter(name_ + ".yaw_slowing_factor", yaw_slowing_factor_);
-    node->get_parameter(name_ + ".latch_xy_goal_tolerance", latch_xy_goal_tolerance_);
     node->get_parameter(name_ + ".scaling_vel_x", scaling_vel_x_);
     node->get_parameter(name_ + ".scaling_factor", scaling_factor_);
     node->get_parameter(name_ + ".scaling_step", scaling_step_);
@@ -243,6 +244,8 @@ namespace graceful_controller
     node->get_parameter(name_ + ".backwards_check_yaw_tolerance", backwards_check_yaw_tolerance_);
 
     node->get_parameter(name_ + ".ignore_orientation_distance", ignore_orientation_distance_);
+
+    node->get_parameter(name_ + ".initial_rotate_start_yaw", initial_rotate_start_yaw_);
 
     // Log loaded parameters
     RCLCPP_INFO(LOGGER, "Parameters loaded:");
@@ -269,13 +272,13 @@ namespace graceful_controller
     RCLCPP_INFO(LOGGER, "  yaw_filter_tolerance: %.2f", yaw_filter_tolerance_);
     RCLCPP_INFO(LOGGER, "  yaw_gap_tolerance: %.2f", yaw_gap_tolerance_);
     RCLCPP_INFO(LOGGER, "  yaw_slowing_factor: %.2f", yaw_slowing_factor_);
-    RCLCPP_INFO(LOGGER, "  latch_xy_goal_tolerance: %s", latch_xy_goal_tolerance_ ? "TRUE" : "FALSE");
     RCLCPP_INFO(LOGGER, "  scaling_vel_x: %.2f", scaling_vel_x_);
     RCLCPP_INFO(LOGGER, "  scaling_factor: %.2f", scaling_factor_);
     RCLCPP_INFO(LOGGER, "  scaling_step: %.2f", scaling_step_);
     RCLCPP_INFO(LOGGER, "  backward_motion_available: %s", backward_motion_available_ ? "TRUE" : "FALSE");
     RCLCPP_INFO(LOGGER, "  backwards_check_yaw_tolerance: %.2f", backwards_check_yaw_tolerance_);
     RCLCPP_INFO(LOGGER, "  ignore_orientation_distance: %.2f", ignore_orientation_distance_);
+    RCLCPP_INFO(LOGGER, "  initial_rotate_start_yaw: %.3f", initial_rotate_start_yaw_);
 
     // Retrieve additional parameters
     resolution_ = costmap_ros_->getCostmap()->getResolution();
@@ -519,7 +522,14 @@ namespace graceful_controller
 
     const double final_yaw_error = angles::shortest_angular_distance(0.0, tf2::getYaw(goal_pose.pose.orientation));
     const double goal_yaw_alignment_distance = 1.0;
-    const double max_moving_yaw_alignment_error = 0.3490658504;  // 20 deg
+    const double goal_yaw_full_alignment_distance = 0.2;
+    const double max_moving_yaw_alignment_error = 0.174533;  // 10 deg
+
+    // Moving final-yaw alignment is permitted only when the robot
+    // is already following the path accurately.
+    const double max_moving_alignment_lateral_error = 0.04;      // 4 cm
+    const double max_moving_alignment_path_heading_error = 0.10; // 5.7 deg
+    const double max_path_final_yaw_difference = 0.174533;            // 10 deg
 
     // If we've reached the XY goal tolerance, decide whether to rotate or stop
     if (dist_to_goal < pose_tolerance.position.x || goal_tolerance_met_)
@@ -531,7 +541,7 @@ namespace graceful_controller
           RCLCPP_INFO(LOGGER, "prefer_final_rotation is enabled. Attempting in-place rotation.");
 
           // Reached goal, latch if desired
-          goal_tolerance_met_ = latch_xy_goal_tolerance_;
+          goal_tolerance_met_ = true;
 
           // FINAL YAW TOLERANCE CHECK FROM GOAL CHECKER
           if (std::abs(final_yaw_error) <= yaw_goal_tolerance)
@@ -558,10 +568,11 @@ namespace graceful_controller
           num_steps = std::max(static_cast<size_t>(1), num_steps);
 
           bool collision_free = true;
+          const double current_robot_yaw = tf2::getYaw(robot_pose.pose.orientation);
           for (size_t i = 1; i <= num_steps; ++i)
           {
             double step = static_cast<double>(i) / static_cast<double>(num_steps);
-            double yaw = step * yaw_delta;
+            const double yaw = angles::normalize_angle(current_robot_yaw + step * yaw_delta);
 
             if (isColliding(robot_pose.pose.position.x, robot_pose.pose.position.y, yaw, costmap_ros_, collision_points_))
             {
@@ -623,22 +634,23 @@ namespace graceful_controller
     }
  
     // Get controller max velocity based on current speed
-    double max_vel_x = max_vel_x_limited_;
-
-    if (velocity.linear.x > max_vel_x)
-    {
-      // If our velocity limit has recently changed,
-      // decelerate towards desired max_vel_x while still respecting acceleration limits
-      double decelerating_max_vel_x = velocity.linear.x - (decel_lim_x_ * acc_dt_);
-      max_vel_x = std::max(max_vel_x, decelerating_max_vel_x);
-      max_vel_x = std::max(max_vel_x, min_vel_x_);
-    }
-    else
-    {
-      // Otherwise, allow up to max acceleration
-      max_vel_x = velocity.linear.x + (acc_lim_x_ * acc_dt_);
-      max_vel_x = std::max(min_vel_x_, std::min(max_vel_x, max_vel_x_limited_));
-    }
+     double max_vel_x = max_vel_x_limited_;
+     double current_speed = std::fabs(velocity.linear.x);
+ 
+     if (current_speed > max_vel_x)
+     {
+       // If our velocity limit has recently changed,
+       // decelerate towards desired max_vel_x while still respecting acceleration limits
+       double decelerating_max_vel_x = current_speed - (decel_lim_x_ * acc_dt_);
+       max_vel_x = std::max(max_vel_x, decelerating_max_vel_x);
+       max_vel_x = std::max(max_vel_x, min_vel_x_);
+     }
+     else
+     {
+       // Otherwise, allow up to max acceleration
+       max_vel_x = current_speed + (acc_lim_x_ * acc_dt_);
+       max_vel_x = std::max(min_vel_x_, std::min(max_vel_x, max_vel_x_limited_));
+     }
 
     // Compute distance along path
     // Transform global plan into robot frame.
@@ -738,48 +750,79 @@ namespace graceful_controller
         continue;
       }
 
-      if (prefer_final_rotation_)
+      const double carrot_yaw = std::atan2(target_pose.pose.position.y, target_pose.pose.position.x);
+
+      const double lateral_error = std::abs(target_pose.pose.position.y);
+
+      // --------------------------------------------------
+      // BACKWARD-MOTION AWARE PATH YAW
+      // --------------------------------------------------
+      // If the target/carrot is behind the robot, the controller is following
+      // the path in reverse. In that case carrot_yaw will be near +/-pi.
+      // For final yaw comparison, use the robot heading direction instead.
+      const bool target_is_behind_robot = target_pose.pose.position.x < 0.0;
+
+      const double effective_path_yaw = target_is_behind_robot
+              ? angles::normalize_angle(carrot_yaw + M_PI)
+              : carrot_yaw;
+
+      const double controller_path_yaw = effective_path_yaw;
+
+      const double path_final_diff = std::abs(angles::shortest_angular_distance(
+                  effective_path_yaw, final_yaw_error));
+
+      const bool moving_goal_yaw_alignment_allowed =
+          dist_to_goal < goal_yaw_alignment_distance &&
+          lateral_error < max_moving_alignment_lateral_error &&
+          std::abs(effective_path_yaw) < max_moving_alignment_path_heading_error &&
+          std::abs(final_yaw_error) <= max_moving_yaw_alignment_error &&
+          path_final_diff < max_path_final_yaw_difference;
+
+      const bool near_goal_yaw_control_zone =
+          dist_to_goal < goal_yaw_alignment_distance &&
+          lateral_error < max_moving_alignment_lateral_error &&
+          std::abs(final_yaw_error) <= max_moving_yaw_alignment_error;
+
+      // --------------------------------------------------
+      // TARGET ORIENTATION FOR CONTROLLER
+      // --------------------------------------------------
+      double target_heading_yaw = controller_path_yaw;
+      double target_yaw_blend = 0.0;
+
+      if (prefer_final_rotation_ && moving_goal_yaw_alignment_allowed)
       {
-        const double carrot_yaw = std::atan2(target_pose.pose.position.y, target_pose.pose.position.x);
+        const double alignment_range =
+            std::max(1e-3, goal_yaw_alignment_distance - goal_yaw_full_alignment_distance);
 
-        const bool moving_goal_yaw_alignment_allowed =
-            dist_to_goal < goal_yaw_alignment_distance &&
-            std::abs(final_yaw_error) <= max_moving_yaw_alignment_error;
+        const double raw_target_yaw_blend =
+            std::clamp((goal_yaw_alignment_distance - dist_to_goal) / alignment_range, 0.0, 1.0);
 
-        if (moving_goal_yaw_alignment_allowed)
-        {
-          // Within 1 m of goal and yaw error is less than 20 deg.
-          // Start aligning to final goal yaw while moving.
-          target_pose.pose.orientation.x = 0.0;
-          target_pose.pose.orientation.y = 0.0;
-          target_pose.pose.orientation.z = std::sin(final_yaw_error / 2.0);
-          target_pose.pose.orientation.w = std::cos(final_yaw_error / 2.0);
+        target_yaw_blend =
+            raw_target_yaw_blend * raw_target_yaw_blend *
+            (3.0 - 2.0 * raw_target_yaw_blend);
 
-          const double current_yaw_error = final_yaw_error;
-          const double current_yaw_error_deg = current_yaw_error * 180.0 / M_PI;
-          const double abs_current_yaw_error_deg = std::abs(current_yaw_error) * 180.0 / M_PI;
+        const double yaw_to_final = angles::shortest_angular_distance(controller_path_yaw, final_yaw_error);
 
-          RCLCPP_INFO(LOGGER, "Moving goal yaw alignment active -> dist_to_goal=%.3f "
-              "current_yaw_error=%.3f current_yaw_error_deg=%.2f abs_yaw_error_deg=%.2f deg max_allowed=%.3f rad",
-              dist_to_goal, current_yaw_error, current_yaw_error_deg, abs_current_yaw_error_deg, max_moving_yaw_alignment_error);
-        }
-        else if (dist_to_goal < active_max_lookahead)
-        {
-          // If yaw error is too large, do not align while moving.
-          // Keep target orientation facing the carrot/path direction.
-          target_pose.pose.orientation.x = 0.0;
-          target_pose.pose.orientation.y = 0.0;
-          target_pose.pose.orientation.z = std::sin(carrot_yaw / 2.0);
-          target_pose.pose.orientation.w = std::cos(carrot_yaw / 2.0);
-
-          if (dist_to_goal < goal_yaw_alignment_distance && std::abs(final_yaw_error) > max_moving_yaw_alignment_error)
-          {
-            RCLCPP_INFO(LOGGER, "Moving goal yaw alignment skipped -> yaw error too large. "
-                "dist_to_goal=%.3f final_yaw_error=%.3f max_allowed=%.3f",
-                dist_to_goal, final_yaw_error, max_moving_yaw_alignment_error);
-          }
-        }
+        target_heading_yaw = angles::normalize_angle(controller_path_yaw + target_yaw_blend * yaw_to_final);
       }
+
+      if (prefer_final_rotation_ && dist_to_goal < active_max_lookahead)
+      {
+        target_pose.pose.orientation.x = 0.0;
+        target_pose.pose.orientation.y = 0.0;
+        target_pose.pose.orientation.z = std::sin(target_heading_yaw / 2.0);
+        target_pose.pose.orientation.w = std::cos(target_heading_yaw / 2.0);
+      }
+
+      RCLCPP_INFO(
+        LOGGER,
+        "Near-goal alignment check -> dist=%.3f lateral=%.3f "
+        "carrot_yaw=%.3f effective_path_yaw=%.3f final_yaw_error=%.3f "
+        "path_final_diff=%.3f target_heading_yaw=%.3f target_yaw_blend=%.3f "
+        "reverse=%s allowed=%s",
+        dist_to_goal, lateral_error, carrot_yaw, effective_path_yaw, final_yaw_error, path_final_diff,
+        target_heading_yaw, target_yaw_blend, target_is_behind_robot ? "true" : "false",
+        moving_goal_yaw_alignment_allowed ? "true" : "false");
 
       // Preserve old minimum-lookahead behavior.
       // Only break when we are not already close to the goal.
@@ -789,8 +832,10 @@ namespace graceful_controller
         break;
       }
 
+      double near_goal_max_vel_x = max_vel_x;
+
       // Iteratively try to find a path, incrementally reducing the velocity
-      double sim_velocity = max_vel_x;
+      double sim_velocity = near_goal_max_vel_x;
       do
       {
         controller_->setVelocityLimits(min_vel_x_, sim_velocity, max_vel_theta_limited_);
@@ -800,51 +845,113 @@ namespace graceful_controller
           RCLCPP_INFO(LOGGER, "After Simulation -> cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
                       cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
         
-          // MOVING FINAL YAW ALIGNMENT CORRECTION / HOLD
-          const bool moving_goal_yaw_alignment_zone = prefer_final_rotation_ &&
-            dist_to_goal < goal_yaw_alignment_distance && std::abs(final_yaw_error) <= max_moving_yaw_alignment_error;
+          // --------------------------------------------------
+          // SMOOTH MOVING FINAL-YAW ALIGNMENT
+          // --------------------------------------------------
+          const bool moving_goal_yaw_alignment_zone = near_goal_yaw_control_zone;
 
           if (moving_goal_yaw_alignment_zone)
           {
-            const double yaw_align_kp = 1.2;
-            const double max_yaw_align_correction = 0.20;
-
+            const double before_linear_x = cmd_vel.twist.linear.x;
             const double before_angular_z = cmd_vel.twist.angular.z;
 
-            if (std::abs(final_yaw_error) <= yaw_goal_tolerance)
+            // 0.0 when entering alignment zone, 1.0 close to goal.
+            // Use smoothstep so blend does not jump suddenly.
+            const double alignment_range =
+                std::max(1e-3, goal_yaw_alignment_distance - goal_yaw_full_alignment_distance);
+
+            const double raw_blend =
+                std::clamp((goal_yaw_alignment_distance - dist_to_goal) / alignment_range, 0.0, 1.0);
+
+            const double yaw_alignment_blend = raw_blend * raw_blend * (3.0 - 2.0 * raw_blend);
+
+            const double yaw_align_kp = 0.8;
+            const double max_yaw_align_rate = 0.10;
+
+            const double final_yaw_angular_z =
+                std::clamp(yaw_align_kp * final_yaw_error,
+                    -max_yaw_align_rate, max_yaw_align_rate);
+
+            const bool angular_command_fights_final_yaw =
+                std::abs(before_angular_z) > 0.01 &&
+                std::abs(final_yaw_error) > 0.005 &&
+                before_angular_z * final_yaw_error < 0.0;
+
+            double effective_yaw_blend = yaw_alignment_blend;
+
+            // Strongly suppress path angular only when final yaw is allowed
+            // or when the path command is clearly fighting final yaw.
+            if (moving_goal_yaw_alignment_allowed || angular_command_fights_final_yaw)
             {
-              // Yaw is already inside tolerance. Do not allow path/carrot angular command to pull yaw away again.
-              cmd_vel.twist.angular.z = 0.0;
-
-              RCLCPP_INFO(LOGGER, "Moving yaw hold -> final_yaw_error=%.3f rad %.2f deg "
-                  "yaw_goal_tolerance=%.3f before_angular_z=%.3f after_angular_z=%.3f",
-                  final_yaw_error, final_yaw_error * 180.0 / M_PI, yaw_goal_tolerance, before_angular_z, cmd_vel.twist.angular.z);
+              effective_yaw_blend = std::max(yaw_alignment_blend, 0.75);
             }
-            else
+
+            double desired_angular_z =
+                (1.0 - effective_yaw_blend) * before_angular_z + effective_yaw_blend * final_yaw_angular_z;
+
+            // Common near-goal angular cap.
+            // Prevents raw path angular spikes like +0.14 rad/s near the goal.
+            const double near_goal_angular_limit =
+                std::clamp(0.18 * (dist_to_goal / goal_yaw_alignment_distance), 0.04, 0.12);
+
+            desired_angular_z = std::clamp(desired_angular_z, -near_goal_angular_limit, near_goal_angular_limit);
+
+            // --------------------------------------------------
+            // STATEFUL ANGULAR SMOOTHING
+            // --------------------------------------------------
+            // Smooth from the previously sent command, not from this cycle's
+            // simulated before_angular_z.
+            double previous_angular_z = before_angular_z;
+
+            if (moving_final_yaw_cmd_valid_)
             {
-              const double yaw_correction = std::clamp(yaw_align_kp * final_yaw_error,
-                      -max_yaw_align_correction, max_yaw_align_correction);
-
-              if (cmd_vel.twist.angular.z * final_yaw_error < 0.0)
-              {
-                cmd_vel.twist.angular.z = yaw_correction;
-              }
-              else
-              {
-                cmd_vel.twist.angular.z += yaw_correction;
-              }
-
-              cmd_vel.twist.angular.z = std::clamp(cmd_vel.twist.angular.z, -max_vel_theta_limited_, max_vel_theta_limited_);
-
-              RCLCPP_INFO(LOGGER, "Moving yaw correction -> final_yaw_error=%.3f rad %.2f deg "
-                  "before_angular_z=%.3f yaw_correction=%.3f after_angular_z=%.3f",
-                  final_yaw_error, final_yaw_error * 180.0 / M_PI, before_angular_z, yaw_correction, cmd_vel.twist.angular.z);
+              previous_angular_z = last_moving_final_yaw_angular_z_;
             }
+
+            const double yaw_alignment_angular_accel_limit = angular_command_fights_final_yaw ? 1.0 : 0.6;
+
+            const double angular_step_limit = std::max(0.006, yaw_alignment_angular_accel_limit * dt);
+
+            const double angular_delta =
+                std::clamp(desired_angular_z - previous_angular_z,
+                    -angular_step_limit, angular_step_limit);
+
+            cmd_vel.twist.angular.z = previous_angular_z + angular_delta;
+
+            cmd_vel.twist.angular.z =
+                std::clamp(cmd_vel.twist.angular.z, -max_vel_theta_limited_, max_vel_theta_limited_);
+
+            cmd_vel.twist.linear.x = before_linear_x;
+
+            moving_final_yaw_cmd_valid_ = true;
+            last_moving_final_yaw_angular_z_ = cmd_vel.twist.angular.z;
+
+            RCLCPP_INFO(
+                LOGGER,
+                "Smooth moving final-yaw alignment -> dist=%.3f raw_blend=%.3f blend=%.3f "
+                "effective_blend=%.3f lateral=%.3f carrot_yaw=%.3f effective_path_yaw=%.3f "
+                "controller_path_yaw=%.3f final_yaw_error=%.3f "
+                "before_linear_x=%.3f after_linear_x=%.3f "
+                "before_angular_z=%.3f previous_angular_z=%.3f final_yaw_angular_z=%.3f "
+                "desired_angular_z=%.3f after_angular_z=%.3f "
+                "angular_step_limit=%.3f fighting=%s",
+                dist_to_goal, raw_blend, yaw_alignment_blend, effective_yaw_blend, lateral_error,
+                carrot_yaw, effective_path_yaw, controller_path_yaw, final_yaw_error,
+                before_linear_x, cmd_vel.twist.linear.x, before_angular_z, previous_angular_z,
+                final_yaw_angular_z, desired_angular_z, cmd_vel.twist.angular.z, angular_step_limit,
+                angular_command_fights_final_yaw ? "true" : "false");
+          }
+          else
+          {
+            moving_final_yaw_cmd_valid_ = false;
           }
 
-          if (dist_to_goal < ignore_orientation_distance_ && !moving_goal_yaw_alignment_zone)
+          const bool path_is_aligned_near_goal = lateral_error < 0.02 && std::abs(effective_path_yaw) < 0.05;
+
+          if (dist_to_goal < ignore_orientation_distance_ &&
+              path_is_aligned_near_goal && !moving_goal_yaw_alignment_zone)
           {
-            RCLCPP_INFO(LOGGER, "Robot is within %.2f meters of the goal. Ignoring orientation changes.", dist_to_goal);
+            RCLCPP_INFO(LOGGER,"Near goal with path already aligned. " "Ignoring remaining orientation change.");
 
             cmd_vel.twist.angular.z = 0.0;
           }
@@ -909,39 +1016,87 @@ namespace graceful_controller
       double vel_x = 0.0, vel_th = 0.0;
       if (sim_initial_rotation_)
       {
-        geometry_msgs::msg::TwistStamped rotation;
-        double yaw_error = rotateTowards(error, velocity, rotation, prefer_final_rotation_);
+        const double target_distance = std::hypot(error.pose.position.x, error.pose.position.y);
 
-        if (fabs(yaw_error) < initial_rotate_tolerance_)
+        double path_bearing = 0.0;
+
+        if (target_distance > 1e-3)
         {
-          if (simulated_path.poses.empty())
-          {
-            has_new_path_ = false;
-          }
-          sim_initial_rotation_ = false;
-        }
-
-        vel_x = rotation.twist.linear.x;
-        vel_th = rotation.twist.angular.z;
-
-        // Only set angular velocity if prefer_final_rotation_ is enabled
-        if (prefer_final_rotation_)
-        {
-          cmd_vel.twist.linear.x = vel_x;
-          cmd_vel.twist.angular.z = vel_th;
-
-          // Log the cmd_vel after rotation command
-          RCLCPP_INFO(LOGGER, "Simulation Rotation -> cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
-                      cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
+          path_bearing = std::atan2(error.pose.position.y, error.pose.position.x);
         }
         else
         {
-          cmd_vel.twist.linear.x = vel_x;
-          cmd_vel.twist.angular.z = 0.0; // Force angular.z to zero
+          path_bearing = tf2::getYaw(error.pose.orientation);
+        }
 
-          // Log the cmd_vel after rotation command
-          RCLCPP_INFO(LOGGER, "Simulation Rotation without angular velocity -> cmd_vel Output -> linear.x: %.2f, angular.z: %.2f",
-                      cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
+        const bool use_backward_initial_rotation = backward_motion_available_ && backward_motion_;
+
+        const double initial_rotation_yaw =
+            use_backward_initial_rotation
+                ? angles::normalize_angle(path_bearing + M_PI)
+                : path_bearing;
+
+        RCLCPP_INFO(
+            LOGGER,
+            "Initial rotation check -> target_distance=%.3f path_bearing=%.3f "
+            "initial_rotation_yaw=%.3f backward_motion_available=%s "
+            "backward_motion=%s mode=%s tolerance=%.3f",
+            target_distance, path_bearing, initial_rotation_yaw,
+            backward_motion_available_ ? "true" : "false",
+            backward_motion_ ? "true" : "false",
+            use_backward_initial_rotation ? "BACKWARD_REAR_TO_PATH" : "FORWARD_FRONT_TO_PATH",
+            initial_rotate_tolerance_);
+
+        const double abs_initial_rotation_yaw = std::abs(initial_rotation_yaw);
+
+        const double initial_rotation_start_threshold =
+            std::max(initial_rotate_start_yaw_, initial_rotate_tolerance_);
+
+        const double initial_rotation_complete_threshold = initial_rotate_tolerance_;
+
+        const bool should_start_initial_rotation =
+            !initial_rotation_in_progress_ && abs_initial_rotation_yaw > initial_rotation_start_threshold;
+
+        const bool should_continue_initial_rotation =
+            initial_rotation_in_progress_ && abs_initial_rotation_yaw > initial_rotation_complete_threshold;
+
+        if (!should_start_initial_rotation && !should_continue_initial_rotation)
+        {
+          has_new_path_ = false;
+          initial_rotation_in_progress_ = false;
+          initial_rotation_consumed_for_goal_ = true;
+          sim_initial_rotation_ = false;
+
+          RCLCPP_INFO(
+              LOGGER,
+              "Initial rotation skipped/completed by REAL yaw -> yaw_error=%.3f "
+              "start_threshold=%.3f complete_threshold=%.3f consumed=true",
+              initial_rotation_yaw, initial_rotation_start_threshold, initial_rotation_complete_threshold);
+        }
+        else
+        {
+          initial_rotation_in_progress_ = true;
+
+          const double initial_rotation_yaw_slowing_factor = 2.5;
+
+          vel_x = 0.0;
+          vel_th =
+              sign(initial_rotation_yaw) *
+              std::clamp(abs_initial_rotation_yaw * initial_rotation_yaw_slowing_factor,
+                  min_in_place_vel_theta_, max_vel_theta_limited_);
+
+          cmd_vel.twist.linear.x = 0.0;
+          cmd_vel.twist.angular.z = vel_th;
+
+          RCLCPP_INFO(
+              LOGGER,
+              "Initial rotation REAL command -> yaw_error=%.3f "
+              "start_threshold=%.3f complete_threshold=%.3f "
+              "linear.x=%.3f angular.z=%.3f in_progress=true",
+              initial_rotation_yaw, initial_rotation_start_threshold, initial_rotation_complete_threshold,
+              cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
+
+          return true;
         }
       }
 
@@ -992,7 +1147,11 @@ namespace graceful_controller
       }
 
       // Generate next pose
-      double dt = (vel_x > 0.0) ? resolution_ / vel_x : 0.1;
+      const double abs_vel_x = std::abs(vel_x);
+
+      double dt = abs_vel_x > 1e-6
+              ? resolution_ / abs_vel_x
+              : 0.1;
       double yaw = tf2::getYaw(next_pose.pose.orientation);
       next_pose.pose.position.x += dt * vel_x * cos(yaw);
       next_pose.pose.position.y += dt * vel_x * sin(yaw);
@@ -1006,12 +1165,15 @@ namespace graceful_controller
 
       // Compute footprint scaling
       double footprint_scaling = 1.0;
-      if (vel_x > scaling_vel_x_)
+      const double abs_scaling_vel_x = std::abs(vel_x);
+
+      if (abs_scaling_vel_x > scaling_vel_x_)
       {
         double ratio = max_vel_x_limited_ - scaling_vel_x_;
-        if (ratio > 0)
+
+        if (ratio > 0.0)
         {
-          ratio = (vel_x - scaling_vel_x_) / ratio;
+          ratio = (abs_scaling_vel_x - scaling_vel_x_) / ratio;
           footprint_scaling += ratio * scaling_factor_;
         }
       }
@@ -1114,26 +1276,37 @@ namespace graceful_controller
       double path_orientation = normalizeAngle(yaw);
       backward_motion_ = false;
 
-      double diff_angle = normalizeAngle(path_orientation - robot_orientation);
-      diff_angle = fabs(diff_angle);
-      double angle_tolerance = fabs(backwards_check_yaw_tolerance_);
+      // Compare which side of the robot is closer to the path direction.
+      // Forward mode: robot front faces path_orientation.
+      // Backward mode: robot rear faces path_orientation, so robot heading should be path_orientation + pi.
+      const double forward_yaw_error = std::abs(angles::shortest_angular_distance(robot_orientation, path_orientation));
 
-      // Check if the angle difference is approximately 180 degrees
-      if (diff_angle > (M_PI - angle_tolerance) && diff_angle < (M_PI + angle_tolerance))
+      const double backward_yaw_error =
+          std::abs(angles::shortest_angular_distance(robot_orientation, angles::normalize_angle(path_orientation + M_PI)));
+
+      const double selection_margin = std::abs(backwards_check_yaw_tolerance_);
+
+      if (backward_motion_available_ && backward_yaw_error + selection_margin < forward_yaw_error)
       {
         backward_motion_ = true;
         global_plan_ = filtered_plan;
-        RCLCPP_INFO(LOGGER, "Backward motion initiated due to angle difference: %.2f radians.", diff_angle);
-      }
-      else if (diff_angle > (-angle_tolerance) && diff_angle < (angle_tolerance))
-      {
-        backward_motion_ = false;
-        global_plan_ = filtered_plan;
-        RCLCPP_INFO(LOGGER, "Backward motion not required. Angle difference: %.2f radians.", diff_angle);
+
+        RCLCPP_INFO(
+            LOGGER,
+            "Backward motion selected -> path_orientation=%.3f robot_orientation=%.3f "
+            "forward_yaw_error=%.3f backward_yaw_error=%.3f margin=%.3f",
+            path_orientation, robot_orientation, forward_yaw_error, backward_yaw_error, selection_margin);
       }
       else
       {
-        RCLCPP_INFO(LOGGER, "Angle difference %.2f radians does not qualify for backward motion.", diff_angle);
+        backward_motion_ = false;
+        global_plan_ = filtered_plan;
+
+        RCLCPP_INFO(
+            LOGGER,
+            "Forward motion selected -> path_orientation=%.3f robot_orientation=%.3f "
+            "forward_yaw_error=%.3f backward_yaw_error=%.3f margin=%.3f",
+            path_orientation, robot_orientation, forward_yaw_error, backward_yaw_error, selection_margin);
       }
     }
     else
@@ -1143,10 +1316,71 @@ namespace graceful_controller
       global_plan_ = filtered_plan;
     }
 
-    // Store the plan for computeVelocityCommands
-    has_new_path_ = true;
+    // --------------------------------------------------
+    // INITIAL ROTATION GOAL-GATING
+    // --------------------------------------------------
+    // Initial rotation should happen only once for a real new goal.
+    // A replan/recovery for the same final goal must not trigger it again.
+
+    bool same_initial_rotation_goal = false;
+
+    if (initial_rotation_goal_valid_ && !filtered_plan.poses.empty())
+    {
+      const auto & old_goal = last_initial_rotation_goal_.pose;
+      const auto & new_goal = filtered_plan.poses.back().pose;
+
+      const double goal_dx = new_goal.position.x - old_goal.position.x;
+      const double goal_dy = new_goal.position.y - old_goal.position.y;
+      const double goal_dist_change = std::hypot(goal_dx, goal_dy);
+
+      const double old_goal_yaw = tf2::getYaw(old_goal.orientation);
+      const double new_goal_yaw = tf2::getYaw(new_goal.orientation);
+
+      const double goal_yaw_change =
+          std::abs(angles::shortest_angular_distance(old_goal_yaw, new_goal_yaw));
+
+      same_initial_rotation_goal =
+          goal_dist_change <= initial_rotation_goal_position_tolerance_ &&
+          goal_yaw_change <= initial_rotation_goal_yaw_tolerance_;
+
+      RCLCPP_INFO(
+          LOGGER,
+          "Initial rotation goal check -> goal_dist_change=%.3f "
+          "goal_yaw_change=%.3f same_goal=%s consumed=%s",
+          goal_dist_change, goal_yaw_change,
+          same_initial_rotation_goal ? "true" : "false",
+          initial_rotation_consumed_for_goal_ ? "true" : "false");
+    }
+
+    if (!same_initial_rotation_goal)
+    {
+      initial_rotation_consumed_for_goal_ = false;
+      initial_rotation_in_progress_ = false;
+
+      if (!filtered_plan.poses.empty())
+      {
+        last_initial_rotation_goal_ = filtered_plan.poses.back();
+        initial_rotation_goal_valid_ = true;
+      }
+
+      RCLCPP_INFO(
+          LOGGER,
+          "New final goal detected -> initial rotation allowed once.");
+    }
+
+    // Only allow initial rotation if it was not already consumed for this same goal.
+    has_new_path_ = initial_rotation_in_progress_ || !initial_rotation_consumed_for_goal_;
+
     goal_tolerance_met_ = false;
-    goal_achieved_ = false; // Reset the flag
+    goal_achieved_ = false;
+    moving_final_yaw_cmd_valid_ = false;
+    last_moving_final_yaw_linear_x_ = 0.0;
+    last_moving_final_yaw_angular_z_ = 0.0;
+
+    RCLCPP_INFO(
+        LOGGER,
+        "Plan set -> has_new_path=%s initial_rotation_consumed_for_goal=%s",
+        has_new_path_ ? "true" : "false", initial_rotation_consumed_for_goal_ ? "true" : "false");
 
     filtered_lookahead_initialized_ = false;
     filtered_max_lookahead_ = max_lookahead_;

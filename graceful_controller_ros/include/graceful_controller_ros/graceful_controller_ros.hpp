@@ -225,6 +225,8 @@ namespace graceful_controller
 		double curve_lookahead_decrease_rate_{0.8};  // m/s, entering curve
 		double curve_lookahead_increase_rate_{0.4};  // m/s, exiting curve
 
+    double initial_rotate_start_yaw_{0.261799};  // 15 deg
+
 		// Goal tolerance
 		bool latch_xy_goal_tolerance_;
 		bool goal_tolerance_met_;
@@ -240,6 +242,21 @@ namespace graceful_controller
 		// Reverse motion addition
 		bool backward_motion_;
 		bool robot_pose_received_ = false;
+
+    bool moving_final_yaw_cmd_valid_{false};
+    double last_moving_final_yaw_linear_x_{0.0};
+    double last_moving_final_yaw_angular_z_{0.0};
+
+    bool initial_rotation_goal_valid_{false};
+    bool initial_rotation_consumed_for_goal_{false};
+
+    geometry_msgs::msg::PoseStamped last_initial_rotation_goal_;
+
+    double initial_rotation_goal_position_tolerance_{0.05};  // 5 cm
+    double initial_rotation_goal_yaw_tolerance_{0.10};       // 5.7 deg
+
+    bool initial_rotation_in_progress_{false};
+        
 		geometry_msgs::msg::PoseStamped robot_pose_;
 		rclcpp::CallbackGroup::SharedPtr callback_group_;
 		rclcpp::executors::SingleThreadedExecutor callback_group_executor_;
@@ -261,4 +278,3 @@ namespace graceful_controller
 } // namespace graceful_controller
  
 #endif // GRACEFUL_CONTROLLER_ROS_GRACEFUL_CONTROLLER_ROS_HPP
- 
