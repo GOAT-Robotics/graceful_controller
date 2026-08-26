@@ -671,7 +671,7 @@
 
     // Do NOT set goal_achieved_ = true here
     // Instead, throw or return a failure for the BT to handle
-    throw std::runtime_error("No reachable pose found. Aborting navigation from BT.");
+    throw std::runtime_error("No reachable pose found. Check and clear map points in the lane before retrying.");
    }
  
    bool GracefulControllerROS::simulate(
