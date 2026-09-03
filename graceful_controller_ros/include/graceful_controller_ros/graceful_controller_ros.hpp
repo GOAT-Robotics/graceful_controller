@@ -256,6 +256,8 @@ namespace graceful_controller
     double initial_rotation_goal_yaw_tolerance_{0.10};       // 5.7 deg
 
     bool initial_rotation_in_progress_{false};
+
+    bool enable_collision_check_{true};
         
 		geometry_msgs::msg::PoseStamped robot_pose_;
 		rclcpp::CallbackGroup::SharedPtr callback_group_;

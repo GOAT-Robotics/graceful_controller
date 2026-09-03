@@ -208,6 +208,8 @@ namespace graceful_controller
 
     declare_parameter_if_not_declared(node, name_ + ".initial_rotate_start_yaw", rclcpp::ParameterValue(0.261799));  // 15 deg
 
+    declare_parameter_if_not_declared(node, name_ + ".enable_collision_check", rclcpp::ParameterValue(true));
+
     // Retrieve parameters
     node->get_parameter(name_ + ".max_vel_x", max_vel_x_);
     node->get_parameter(name_ + ".min_vel_x", min_vel_x_);
@@ -246,6 +248,8 @@ namespace graceful_controller
     node->get_parameter(name_ + ".ignore_orientation_distance", ignore_orientation_distance_);
 
     node->get_parameter(name_ + ".initial_rotate_start_yaw", initial_rotate_start_yaw_);
+
+    node->get_parameter(name_ + ".enable_collision_check", enable_collision_check_);
 
     // Log loaded parameters
     RCLCPP_INFO(LOGGER, "Parameters loaded:");
@@ -574,13 +578,13 @@ namespace graceful_controller
             double step = static_cast<double>(i) / static_cast<double>(num_steps);
             const double yaw = angles::normalize_angle(current_robot_yaw + step * yaw_delta);
 
-            if (isColliding(robot_pose.pose.position.x, robot_pose.pose.position.y, yaw, costmap_ros_, collision_points_))
+            if (enable_collision_check_ && isColliding(robot_pose.pose.position.x, robot_pose.pose.position.y, yaw, costmap_ros_, collision_points_))
             {
               RCLCPP_INFO(LOGGER, "Unable to rotate in place due to collision at step %lu.", i);
-              if (collision_points_ && !collision_points_->markers.empty())
+              if (collision_points_pub_ && collision_points_ && !collision_points_->markers.empty())
               {
-                collision_points_->markers[0].header.stamp = clock_->now();
-                collision_points_pub_->publish(*collision_points_);
+                  collision_points_->markers[0].header.stamp = clock_->now();
+                  collision_points_pub_->publish(*collision_points_);
               }
               // Reset to zero velocity
               cmd_vel.twist = geometry_msgs::msg::Twist();
@@ -594,7 +598,14 @@ namespace graceful_controller
           }
           if (collision_free)
           {
-            RCLCPP_INFO(LOGGER, "No collisions detected during rotation. Executing rotation command.");
+            if (!enable_collision_check_)
+            {
+                RCLCPP_INFO(LOGGER, "Collision checking disabled. Executing rotation command.");
+            }
+            else
+            {
+                RCLCPP_INFO(LOGGER, "No collisions detected during rotation. Executing rotation command.");
+            }
             RCLCPP_INFO(LOGGER, "cmd_vel Output -> linear.x: %.2f, angular.z: %.2f", cmd_vel.twist.linear.x, cmd_vel.twist.angular.z);
             return cmd_vel;
           }
@@ -968,7 +979,7 @@ namespace graceful_controller
 
     // Do NOT set goal_achieved_ = true here
     // Instead, throw or return a failure for the BT to handle
-    throw std::runtime_error("No reachable pose found. Aborting navigation from BT.");
+    throw std::runtime_error("No reachable pose found. Check and clear map points in the lane before retrying.");
   }
  
   bool GracefulControllerROS::simulate(
@@ -985,7 +996,7 @@ namespace graceful_controller
     bool sim_initial_rotation_ = has_new_path_ && initial_rotate_tolerance_ > 0.0;
  
     // Clear any previous visualizations
-    if (collision_points_)
+    if (enable_collision_check_ && collision_points_)
     {
       collision_points_->markers.resize(0);
     }
@@ -1123,7 +1134,7 @@ namespace graceful_controller
         target_pose_pub_->publish(target_pose);
 
         // Publish visualization if desired
-        if (collision_points_ && !collision_points_->markers.empty())
+        if (collision_points_pub_ && collision_points_ && !collision_points_->markers.empty())
         {
           collision_points_->markers[0].header.stamp = clock_->now();
           collision_points_pub_->publish(*collision_points_);
@@ -1180,14 +1191,19 @@ namespace graceful_controller
 
       // Check next pose for collision
       tf2::doTransform(next_pose, next_pose, robot_to_costmap_transform_);
-      bool collision = isColliding(next_pose.pose.position.x, next_pose.pose.position.y, tf2::getYaw(next_pose.pose.orientation),
+      
+      bool collision = false;
+      if (enable_collision_check_)
+      {
+          collision = isColliding(next_pose.pose.position.x, next_pose.pose.position.y, tf2::getYaw(next_pose.pose.orientation),
                                   costmap_ros_, collision_points_, footprint_scaling);
+      }
       if (collision)
       {
         RCLCPP_INFO(LOGGER, "Collision detected at simulated pose: [x: %.2f, y: %.2f]",
                     next_pose.pose.position.x, next_pose.pose.position.y);
 
-        if (collision_points_ && !collision_points_->markers.empty())
+        if (collision_points_pub_ && collision_points_ && !collision_points_->markers.empty())
         {
           collision_points_->markers[0].header.stamp = clock_->now();
           collision_points_pub_->publish(*collision_points_);
